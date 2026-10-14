@@ -394,12 +394,34 @@ impl App {
                         KeyCode::Char('j') | KeyCode::Down => match self.focus {
                             Focus::Jobs => self.select_next_job(),
                         },
-                        KeyCode::Char('g') => match self.focus {
+                        KeyCode::Char('g' | '0') => match self.focus {
                             Focus::Jobs => self.select_first_job(),
                         },
-                        KeyCode::Char('G') => match self.focus {
+                        KeyCode::Char('G' | '$') => match self.focus {
                             Focus::Jobs => self.select_last_job(),
                         },
+                        KeyCode::Char('f')
+                            if key
+                                .modifiers
+                                .contains(crossterm::event::KeyModifiers::CONTROL) =>
+                        {
+                            match self.focus {
+                                Focus::Jobs => {
+                                    self.job_list_state.scroll_down_by(self.job_list_height)
+                                }
+                            }
+                        }
+                        KeyCode::Char('b')
+                            if key
+                                .modifiers
+                                .contains(crossterm::event::KeyModifiers::CONTROL) =>
+                        {
+                            match self.focus {
+                                Focus::Jobs => {
+                                    self.job_list_state.scroll_up_by(self.job_list_height)
+                                }
+                            }
+                        }
                         KeyCode::Char('u') => match self.focus {
                             Focus::Jobs => {
                                 if key
@@ -543,6 +565,8 @@ impl App {
         let help_options = vec![
             ("q", "quit"),
             ("⏶/⏷", "navigate"),
+            ("^f/^b", "page jobs"),
+            ("0/$", "first/last job"),
             ("pgup/pgdown", "scroll"),
             ("home/end", "top/bottom"),
             ("esc", "cancel"),

@@ -62,6 +62,13 @@ In your `config.fish` or in a separate `completions/turm.fish` file, add the fol
 turm completion fish | source
 ```
 
+## Keyboard navigation
+
+In the job list, use `j`/`k` or the arrow keys to move down/up, `Ctrl-F`/`Ctrl-B`
+to move a full page down/up, and `Ctrl-D`/`Ctrl-U` to move half a page down/up.
+Use `0` or `g` to select the first job, and `$` or `G` to select the last job.
+`PageUp`/`PageDown` scroll the job output; `Home`/`End` jump to its top/bottom.
+
 ## How it works
 
 `turm` obtains information about jobs by parsing the output of `squeue`.

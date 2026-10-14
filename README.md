@@ -69,6 +69,15 @@ to move a full page down/up, and `Ctrl-D`/`Ctrl-U` to move half a page down/up.
 Use `0` or `g` to select the first job, and `$` or `G` to select the last job.
 `PageUp`/`PageDown` scroll the job output; `Home`/`End` jump to its top/bottom.
 
+Press `/` to filter the job list as you type. Matching is case-insensitive across
+job name, owner, partition (pool), and status (full name or abbreviated code).
+Space-separated terms must all match, so `alice gpu running` shows Alice's running
+jobs in GPU partitions. Terms are literal substrings, not regular expressions.
+Press `Enter` to keep the filter and return to navigation, `Esc` while editing to
+restore the previous filter, or `Esc` while navigating to clear it. `Ctrl-U` clears
+the input while editing. The filter stays active as the queue refreshes, and the
+list title shows matching/total job counts.
+
 ## How it works
 
 `turm` obtains information about jobs by parsing the output of `squeue`.

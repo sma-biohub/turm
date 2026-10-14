@@ -18,7 +18,7 @@ use ratatui::{
     widgets::{Block, BorderType, Borders, Clear, List, ListItem, ListState, Paragraph, Wrap},
 };
 use std::io;
-use tui_input::{Input, backend::crossterm::EventHandler};
+use tui_input::{Input, InputRequest, backend::crossterm::EventHandler};
 
 pub enum Focus {
     Jobs,
@@ -53,6 +53,9 @@ pub struct App {
     focus: Focus,
     dialog: Option<Dialog>,
     jobs: Vec<Job>,
+    visible_jobs: Vec<usize>,
+    filter: Input,
+    filter_before_edit: Option<String>,
     job_list_state: ListState,
     job_output: Result<String, FileWatcherError>,
     job_output_anchor: ScrollAnchor,
@@ -138,6 +141,9 @@ impl App {
             focus: Focus::Jobs,
             dialog: None,
             jobs: Vec::new(),
+            visible_jobs: Vec::new(),
+            filter: Input::default(),
+            filter_before_edit: None,
             _job_watcher: JobWatcherHandle::new(
                 sender.clone(),
                 Duration::from_secs(slurm_refresh_rate),
@@ -212,10 +218,19 @@ impl App {
     fn handle_input_event(&mut self, event: Event) -> (bool, bool) {
         match event {
             Event::Key(key) => {
-                if key.code == KeyCode::Char('q') {
+                if key.code == KeyCode::Char('q') && self.filter_before_edit.is_none() {
                     return (true, false);
                 }
                 self.handle(AppMessage::Key(key));
+                (false, true)
+            }
+            Event::Paste(text) if self.filter_before_edit.is_some() => {
+                let old_id = self.selected_job_id();
+                for c in text.chars().filter(|c| !c.is_control()) {
+                    self.filter.handle(InputRequest::InsertChar(c));
+                }
+                self.apply_filter(old_id);
+                self.update_output_file();
                 (false, true)
             }
             Event::Paste(_) => (false, false),
@@ -283,28 +298,25 @@ impl App {
     fn handle(&mut self, msg: AppMessage) {
         match msg {
             AppMessage::Jobs(jobs) => {
-                // On refresh: keep the same job selected if it still exists
-                let old_index = self.job_list_state.selected();
-                let old_id = old_index.and_then(|i| self.jobs.get(i)).map(|j| j.id());
-
+                let old_id = self.selected_job_id();
                 self.jobs = jobs;
-
-                if self.jobs.is_empty() {
-                    self.job_list_state.select(None);
-                } else if let Some(id) = old_id {
-                    let new_index = self
-                        .jobs
-                        .iter()
-                        .position(|j| j.id() == id)
-                        .unwrap_or(old_index.unwrap_or(0).min(self.jobs.len() - 1));
-                    self.job_list_state.select(Some(new_index));
-                } else {
-                    self.job_list_state.select_first();
-                }
+                self.apply_filter(old_id);
             }
             AppMessage::JobOutput(content) => self.job_output = content,
             AppMessage::Key(key) => {
-                if self.dialog.is_some() {
+                if self.filter_before_edit.is_some() {
+                    let old_id = self.selected_job_id();
+                    match key.code {
+                        KeyCode::Enter => self.filter_before_edit = None,
+                        KeyCode::Esc => {
+                            self.filter = Input::new(self.filter_before_edit.take().unwrap());
+                        }
+                        _ => {
+                            self.filter.handle_event(&Event::Key(key));
+                        }
+                    }
+                    self.apply_filter(old_id);
+                } else if self.dialog.is_some() {
                     let mut close_dialog = false;
                     let mut scancel_request = None;
                     let mut timelimit_request = None;
@@ -386,6 +398,14 @@ impl App {
                     }
                 } else {
                     match key.code {
+                        KeyCode::Char('/') => {
+                            self.filter_before_edit = Some(self.filter.value().to_string());
+                        }
+                        KeyCode::Esc => {
+                            let old_id = self.selected_job_id();
+                            self.filter = Input::default();
+                            self.apply_filter(old_id);
+                        }
                         KeyCode::Char('h') | KeyCode::Left => self.focus_previous_panel(),
                         KeyCode::Char('l') | KeyCode::Right => self.focus_next_panel(),
                         KeyCode::Char('k') | KeyCode::Up => match self.focus {
@@ -509,7 +529,7 @@ impl App {
                 }
             }
             AppMessage::MouseClick(index) => {
-                if self.dialog.is_none() && index < self.jobs.len() {
+                if self.dialog.is_none() && index < self.visible_jobs.len() {
                     self.job_list_state.select(Some(index));
                 }
             }
@@ -533,22 +553,32 @@ impl App {
             }
         }
 
-        // update
-        self.job_output_watcher
-            .set_file_path(self.job_list_state.selected().and_then(|i| {
-                self.jobs.get(i).and_then(|j| match self.output_file_view {
-                    OutputFileView::Stdout => j.stdout.clone(),
-                    OutputFileView::Stderr => j.stderr.clone(),
-                })
-            }));
+        // Clamp navigation before using the selection for commands or output.
+        self.clamp_job_selection();
+        self.update_output_file();
+    }
+
+    fn update_output_file(&mut self) {
+        let path = self
+            .selected_job()
+            .and_then(|job| match self.output_file_view {
+                OutputFileView::Stdout => job.stdout.clone(),
+                OutputFileView::Stderr => job.stderr.clone(),
+            });
+        self.job_output_watcher.set_file_path(path);
     }
 
     fn ui(&mut self, f: &mut Frame) {
         // Layout
 
+        let show_filter = self.filter_before_edit.is_some() || !self.filter.value().is_empty();
         let content_help = Layout::default()
             .direction(Direction::Vertical)
-            .constraints([Constraint::Min(3), Constraint::Length(1)].as_ref())
+            .constraints([
+                Constraint::Min(3),
+                Constraint::Length(u16::from(show_filter)),
+                Constraint::Length(1),
+            ])
             .split(f.area());
 
         let master_detail = Layout::default()
@@ -564,12 +594,13 @@ impl App {
         // Help
         let help_options = vec![
             ("q", "quit"),
+            ("/", "filter jobs"),
             ("⏶/⏷", "navigate"),
             ("^f/^b", "page jobs"),
             ("0/$", "first/last job"),
             ("pgup/pgdown", "scroll"),
             ("home/end", "top/bottom"),
-            ("esc", "cancel"),
+            ("esc", "cancel/clear filter"),
             ("enter", "confirm"),
             ("c/C", "cancel/signal"),
             ("t", "set time limit"),
@@ -592,8 +623,32 @@ impl App {
             },
         ));
 
-        let help = Paragraph::new(help);
-        f.render_widget(help, content_help[1]);
+        let help = if self.filter_before_edit.is_some() {
+            Line::raw(
+                "Filter jobs: name, owner, partition, status | enter: apply | esc: cancel | ctrl-u: clear",
+            )
+        } else {
+            help
+        };
+        f.render_widget(Paragraph::new(help), content_help[2]);
+
+        if show_filter {
+            let areas = Layout::horizontal([Constraint::Length(9), Constraint::Min(1)])
+                .split(content_help[1]);
+            f.render_widget(Paragraph::new("Filter: /"), areas[0]);
+            let width = areas[1].width.saturating_sub(1) as usize;
+            let scroll = self.filter.visual_scroll(width);
+            f.render_widget(
+                Paragraph::new(self.filter.value()).scroll((0, scroll as u16)),
+                areas[1],
+            );
+            if self.filter_before_edit.is_some() && areas[1].width > 0 {
+                f.set_cursor_position((
+                    areas[1].x + (self.filter.visual_cursor() - scroll) as u16,
+                    areas[1].y,
+                ));
+            }
+        }
 
         // Jobs
         let max_id_len = self.jobs.iter().map(|j| j.id().len()).max().unwrap_or(0);
@@ -612,8 +667,9 @@ impl App {
             .max()
             .unwrap_or(0);
         let jobs: Vec<ListItem> = self
-            .jobs
+            .visible_jobs
             .iter()
+            .map(|&i| &self.jobs[i])
             .map(|j| {
                 ListItem::new(Line::from(vec![
                     Span::styled(
@@ -652,7 +708,11 @@ impl App {
         let job_list = List::new(jobs)
             .block(
                 Block::default()
-                    .title(format!("─Jobs ({})", self.jobs.len()))
+                    .title(if self.filter.value().trim().is_empty() {
+                        format!("─Jobs ({})", self.jobs.len())
+                    } else {
+                        format!("─Jobs ({}/{})", self.visible_jobs.len(), self.jobs.len())
+                    })
                     .borders(Borders::ALL)
                     .border_type(BorderType::Rounded)
                     .border_style(if self.dialog.is_some() {
@@ -665,15 +725,23 @@ impl App {
             )
             .highlight_style(Style::default().bg(Color::Green).fg(Color::Black));
         f.render_stateful_widget(job_list, master_detail[0], &mut self.job_list_state);
+        if self.visible_jobs.is_empty() && !self.filter.value().trim().is_empty() {
+            f.render_widget(
+                Paragraph::new("No matching jobs"),
+                Rect::new(
+                    master_detail[0].x.saturating_add(1),
+                    master_detail[0].y.saturating_add(1),
+                    master_detail[0].width.saturating_sub(2),
+                    master_detail[0].height.saturating_sub(2),
+                ),
+            );
+        }
         self.job_list_height = master_detail[0].height.saturating_sub(2); // account for borders
         self.job_list_area = master_detail[0];
 
         // Job details
 
-        let job_detail = self
-            .job_list_state
-            .selected()
-            .and_then(|i| self.jobs.get(i));
+        let job_detail = self.selected_job();
 
         let job_detail = job_detail.map(|j| {
             let mut state_spans = vec![
@@ -1036,10 +1104,35 @@ fn fit_text(
 }
 
 impl App {
+    fn apply_filter(&mut self, selected_id: Option<String>) {
+        self.visible_jobs = filtered_job_indices(&self.jobs, self.filter.value());
+        restore_job_selection(
+            &self.jobs,
+            &self.visible_jobs,
+            &mut self.job_list_state,
+            selected_id.as_deref(),
+        );
+    }
+
+    fn clamp_job_selection(&mut self) {
+        let selected = if self.visible_jobs.is_empty() {
+            None
+        } else {
+            Some(
+                self.job_list_state
+                    .selected()
+                    .unwrap_or(0)
+                    .min(self.visible_jobs.len() - 1),
+            )
+        };
+        self.job_list_state.select(selected);
+    }
+
     fn selected_job(&self) -> Option<&Job> {
         self.job_list_state
             .selected()
-            .and_then(|i| self.jobs.get(i))
+            .and_then(|i| self.visible_jobs.get(i))
+            .and_then(|&i| self.jobs.get(i))
     }
 
     fn selected_job_id(&self) -> Option<String> {
@@ -1083,7 +1176,7 @@ impl App {
     }
 
     fn job_index_at(&self, column: u16, row: u16) -> Option<usize> {
-        if self.jobs.is_empty() {
+        if self.visible_jobs.is_empty() {
             return None;
         }
         let inner = Rect::new(
@@ -1098,7 +1191,7 @@ impl App {
 
         let row_in_list = (row - inner.y) as usize;
         let index = self.job_list_state.offset().saturating_add(row_in_list);
-        (index < self.jobs.len()).then_some(index)
+        (index < self.visible_jobs.len()).then_some(index)
     }
 
     fn scroll_job_output_down_by(&mut self, delta: u16) {
@@ -1122,6 +1215,49 @@ impl App {
             }
         }
     }
+}
+
+fn filtered_job_indices(jobs: &[Job], query: &str) -> Vec<usize> {
+    let query = query.to_lowercase();
+    let terms: Vec<_> = query.split_whitespace().collect();
+    if terms.is_empty() {
+        return (0..jobs.len()).collect();
+    }
+    jobs.iter()
+        .enumerate()
+        .filter(|(_, job)| {
+            let fields = [
+                &job.name,
+                &job.user,
+                &job.partition,
+                &job.state,
+                &job.state_compact,
+            ]
+            .map(|field| field.to_lowercase());
+            terms
+                .iter()
+                .all(|term| fields.iter().any(|field| field.contains(term)))
+        })
+        .map(|(i, _)| i)
+        .collect()
+}
+
+fn restore_job_selection(
+    jobs: &[Job],
+    visible: &[usize],
+    state: &mut ListState,
+    selected_id: Option<&str>,
+) {
+    let selected = if visible.is_empty() {
+        None
+    } else {
+        Some(
+            selected_id
+                .and_then(|id| visible.iter().position(|&i| jobs[i].id() == id))
+                .unwrap_or(state.selected().unwrap_or(0).min(visible.len() - 1)),
+        )
+    };
+    state.select(selected);
 }
 
 fn rect_contains(rect: Rect, column: u16, row: u16) -> bool {
@@ -1228,6 +1364,79 @@ fn execute_command(mut command: Command, command_label: String) -> Result<(), Co
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn job(id: &str, name: &str, user: &str, partition: &str, state: &str, code: &str) -> Job {
+        Job {
+            job_id: id.into(),
+            array_id: id.into(),
+            array_step: None,
+            name: name.into(),
+            user: user.into(),
+            partition: partition.into(),
+            state: state.into(),
+            state_compact: code.into(),
+            reason: None,
+            time: String::new(),
+            time_limit: String::new(),
+            start_time: String::new(),
+            tres: String::new(),
+            nodelist: String::new(),
+            stdout: None,
+            stderr: None,
+            command: String::new(),
+        }
+    }
+
+    #[test]
+    fn filter_matches_requested_fields_and_requires_every_term() {
+        let jobs = vec![
+            job("1", "Train.Model", "Alice", "GPU", "RUNNING", "R"),
+            job("2", "eval-suite", "Bob", "cpu", "PENDING", "PD"),
+        ];
+        for query in ["train", "ALICE", "gpu", "running", "alice gpu train r"] {
+            assert_eq!(filtered_job_indices(&jobs, query), vec![0], "{query}");
+        }
+        for query in ["eval", "bob", "CPU", "pending", "PD"] {
+            assert_eq!(filtered_job_indices(&jobs, query), vec![1], "{query}");
+        }
+        assert!(filtered_job_indices(&jobs, "alice pending").is_empty());
+        assert!(filtered_job_indices(&jobs, "train.*").is_empty());
+        assert_eq!(filtered_job_indices(&jobs, "  \t "), vec![0, 1]);
+        assert!(filtered_job_indices(&[], "gpu").is_empty());
+    }
+
+    #[test]
+    fn filter_selection_tracks_job_identity_across_filtering_and_refresh() {
+        let mut jobs = vec![
+            job("1", "train", "alice", "gpu", "RUNNING", "R"),
+            job("2", "eval", "bob", "cpu", "PENDING", "PD"),
+        ];
+        let mut state = ListState::default().with_selected(Some(1));
+        let visible = filtered_job_indices(&jobs, "pending");
+        restore_job_selection(&jobs, &visible, &mut state, Some("2"));
+        assert_eq!(state.selected().map(|i| visible[i]), Some(1));
+
+        // Clearing the filter preserves the selected job at its new visible index.
+        restore_job_selection(&jobs, &[0, 1], &mut state, Some("2"));
+        assert_eq!(state.selected(), Some(1));
+
+        // Queue refreshes can reorder jobs without moving selection to a different job.
+        jobs.swap(0, 1);
+        restore_job_selection(&jobs, &[0, 1], &mut state, Some("2"));
+        assert_eq!(state.selected(), Some(0));
+    }
+
+    #[test]
+    fn filter_selection_handles_missing_jobs_and_no_matches() {
+        let jobs = vec![job("1", "train", "alice", "gpu", "RUNNING", "R")];
+        let mut state = ListState::default().with_selected(Some(20));
+        restore_job_selection(&jobs, &[0], &mut state, Some("removed"));
+        assert_eq!(state.selected(), Some(0));
+        restore_job_selection(&jobs, &[], &mut state, Some("1"));
+        assert_eq!(state.selected(), None);
+        restore_job_selection(&jobs, &[0], &mut state, None);
+        assert_eq!(state.selected(), Some(0));
+    }
 
     #[test]
     fn test_chunked_string() {
